@@ -1,0 +1,15 @@
+# Data repository
+data/
+
+# Python cache files
+__pycache__/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Environment files
+.env
+.venv/
+
+# Logs
+logs/
