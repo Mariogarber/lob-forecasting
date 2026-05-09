@@ -10,6 +10,7 @@ __pycache__/
 # Environment files
 .env
 .venv/
+superpowers/
 
 # Logs
 logs/
