@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git check-ignore *)",
+      "Bash(uv sync *)",
+      "Bash(uv run *)",
+      "Bash(dir \"C:\\\\Users\\\\mario\\\\OneDrive\\\\Documentos\\\\UPM\\\\Master_Data\\\\lob-forecasting\\\\src\\\\profiling\")",
+      "Bash(dir \"C:\\\\Users\\\\mario\\\\OneDrive\\\\Documentos\\\\UPM\\\\Master_Data\\\\lob-forecasting\\\\tests\\\\profiling\")",
+      "Bash(python -c \"import json; json.load\\(open\\('exploration/profiling.ipynb'\\)\\); print\\('valid JSON'\\)\")",
+      "Bash(python -c \"import json; json.load\\(open\\('exploration/profiling.ipynb'\\)\\); print\\('valid'\\)\")"
+    ]
+  }
+}
