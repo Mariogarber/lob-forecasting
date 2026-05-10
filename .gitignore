@@ -14,3 +14,10 @@ superpowers/
 
 # Logs
 logs/
+
+# IDE files
+.vscode/
+.claude/
+
+# Test
+.coverage
