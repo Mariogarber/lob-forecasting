@@ -67,7 +67,11 @@ def bid_ask_volume_imbalance(df: pd.DataFrame) -> pd.Series:
     bid_vol = df[[f"v{i}" for i in range(6)]].sum(axis=1)
     ask_vol = df[[f"v{i}" for i in range(6, 12)]].sum(axis=1)
     total = bid_vol + ask_vol
-    return (bid_vol - ask_vol) / total.replace(0, 1e-8)
+    numerator = bid_vol - ask_vol
+    result = pd.Series(0.0, index=df.index)
+    mask = total.abs() > 0.1
+    result[mask] = numerator[mask] / total[mask]
+    return result.clip(-1, 1)
 
 
 def depth_imbalance_by_level(df: pd.DataFrame, level: int) -> pd.Series:
@@ -94,4 +98,8 @@ def depth_imbalance_by_level(df: pd.DataFrame, level: int) -> pd.Series:
     bid_vol = df[bid_col]
     ask_vol = df[ask_col]
     total = bid_vol + ask_vol
-    return (bid_vol - ask_vol) / total.replace(0, 1e-8)
+    numerator = bid_vol - ask_vol
+    result = pd.Series(0.0, index=df.index)
+    mask = total.abs() > 0.1
+    result[mask] = numerator[mask] / total[mask]
+    return result.clip(-1, 1)

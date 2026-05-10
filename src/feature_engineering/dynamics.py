@@ -7,8 +7,8 @@ Extracts temporal change features from LOB sequences:
 """
 
 import pandas as pd
-from src.feature_engineering.microstructure import mid_price
-from src.feature_engineering.utils import _lagged_change
+from feature_engineering.microstructure import mid_price
+from feature_engineering.utils import _lagged_change
 
 
 def price_momentum(df: pd.DataFrame, lag: int = 1) -> pd.Series:

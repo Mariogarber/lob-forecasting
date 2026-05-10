@@ -8,13 +8,19 @@ Main entry point: `add_engineered_features(df)`
 """
 
 import pandas as pd
-from src.feature_engineering.microstructure import (
+from feature_engineering.microstructure import (
     spread, mid_price, bid_ask_volume_imbalance, depth_imbalance_by_level
 )
-from src.feature_engineering.dynamics import (
+from feature_engineering.dynamics import (
     price_momentum, volume_momentum, bid_ask_momentum_diff
 )
 
+ENGINEERED_FEATURES = [
+    "spread", "mid_price", "bid_ask_volume_imbalance",
+    "depth_imbalance_level_0", "depth_imbalance_level_1", "depth_imbalance_level_2",
+    "depth_imbalance_level_3", "depth_imbalance_level_4", "depth_imbalance_level_5",
+    "price_momentum", "volume_momentum", "bid_ask_momentum_diff",
+]
 
 def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -68,5 +74,5 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
 __all__ = [
     "add_engineered_features",
     "spread", "mid_price", "bid_ask_volume_imbalance", "depth_imbalance_by_level",
-    "price_momentum", "volume_momentum", "bid_ask_momentum_diff",
+    "price_momentum", "volume_momentum", "bid_ask_momentum_diff", "ENGINEERED_FEATURES"
 ]
