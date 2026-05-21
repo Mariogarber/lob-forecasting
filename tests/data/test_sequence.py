@@ -1,0 +1,46 @@
+"""Tests for the sequence-data pipeline."""
+
+import numpy as np
+import torch
+
+from data import (
+    FEATURE_COLS,
+    SequenceDataset,
+    pad_collate,
+    sequences_from_dataframe,
+    split_by_seq_ix,
+)
+from data.constants import SEQ_LEN, WARMUP_STEPS
+
+
+def test_sequences_have_expected_shape(tiny_lob_df):
+    arrays = sequences_from_dataframe(tiny_lob_df)
+    n_seq = tiny_lob_df["seq_ix"].nunique()
+    assert arrays.features.shape == (n_seq, SEQ_LEN, len(FEATURE_COLS))
+    assert arrays.targets.shape == (n_seq, SEQ_LEN, 2)
+    assert arrays.mask.shape == (n_seq, SEQ_LEN)
+
+
+def test_mask_excludes_warmup(tiny_lob_df):
+    arrays = sequences_from_dataframe(tiny_lob_df)
+    # warm-up rows (step < 99) should be False, the rest True
+    assert (arrays.mask[:, :WARMUP_STEPS] == False).all()
+    assert (arrays.mask[:, WARMUP_STEPS:] == True).all()
+
+
+def test_split_by_seq_ix_disjoint(tiny_lob_df):
+    train_df, val_df = split_by_seq_ix(tiny_lob_df, val_fraction=0.25, seed=0)
+    train_ids = set(train_df["seq_ix"].unique())
+    val_ids = set(val_df["seq_ix"].unique())
+    assert train_ids.isdisjoint(val_ids)
+    assert train_ids | val_ids == set(tiny_lob_df["seq_ix"].unique())
+
+
+def test_sequence_dataset_collate(tiny_lob_df):
+    arrays = sequences_from_dataframe(tiny_lob_df)
+    ds = SequenceDataset(arrays)
+    batch = pad_collate([ds[i] for i in range(min(3, len(ds)))])
+    assert batch["features"].shape == (3, SEQ_LEN, len(FEATURE_COLS))
+    assert batch["targets"].shape == (3, SEQ_LEN, 2)
+    assert batch["mask"].dtype == torch.bool
+    assert batch["seq_id"].shape == (3,)
