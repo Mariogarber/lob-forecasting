@@ -1,0 +1,54 @@
+# Conda environment for the Wunder Predictorium LOB pipeline.
+#
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate lob
+#
+# PyTorch is installed via the cu121 pip wheels (most reliable on consumer
+# RTX cards under WSL2 / Linux with NVIDIA driver 595+). Conda packages are
+# kept to the bare numerical stack to avoid solver pain.
+
+name: lob
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  # numerical / data
+  - numpy>=1.26
+  - pandas>=2.2
+  - pyarrow>=15
+  - scipy>=1.11
+  - scikit-learn>=1.4
+  # gradient boosting
+  - lightgbm>=4.3
+  - xgboost>=2.0
+  - catboost>=1.2
+  # plotting
+  - matplotlib>=3.8
+  - seaborn>=0.13
+  # notebooks
+  - ipykernel>=6.29
+  - jupyterlab>=4.0
+  # tests
+  - pytest>=8.0
+  - pip:
+      # PyTorch CUDA 12.1 wheels (compatible with RTX 4060 + driver 595)
+      - --extra-index-url=https://download.pytorch.org/whl/cu121
+      - torch==2.5.1
+      - torchvision==0.20.1
+      - torchaudio==2.5.1
+      # sequence models
+      - mamba-ssm>=2.2.2
+      - causal-conv1d>=1.4.0
+      - mambapy>=1.2.0
+      - einops>=0.8
+      # training tooling
+      - pyyaml>=6.0
+      - omegaconf>=2.3
+      - tqdm>=4.66
+      - rich>=13
+      - tensorboard>=2.16
+      # submission packaging
+      - onnx>=1.16
+      - onnxruntime>=1.18

@@ -1,0 +1,2 @@
+[console_scripts]
+lob = pipeline.cli:main

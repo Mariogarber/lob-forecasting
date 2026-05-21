@@ -1,0 +1,22 @@
+model:
+  name: random_forest
+  params:
+    n_estimators: 300
+    max_depth: 16
+    min_samples_leaf: 100
+    n_jobs: -1
+    random_state: 0
+
+data:
+  train_path: competition_package/datasets/train.parquet
+  valid_path: competition_package/datasets/valid.parquet
+  val_fraction: 0.0
+  seed: 0
+  scaling: none  # Trees don't need scaling.
+
+classical:
+  with_engineered: true
+  rolling_windows: [5, 20]
+  only_scored_rows: true
+  drop_warmup: true
+  log: true

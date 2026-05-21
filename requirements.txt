@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------
+# Wunder Predictorium - LOB forecasting pipeline
+#
+# Install (conda + pip — recommended):
+#   conda create -n lob python=3.12 -y
+#   conda activate lob
+#   pip install -r requirements.txt
+#
+# This installs the CUDA 12.1 build of PyTorch (compatible with the user's
+# RTX 4060 + driver 595.79). For CPU-only, replace the --extra-index-url line
+# below with the default PyPI source.
+# ---------------------------------------------------------------------------
+
+# --- PyTorch (CUDA 12.1 wheels) ---
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
+# --- Numerical / data ---
+numpy>=1.26,<3.0
+pandas>=2.2
+pyarrow>=15
+scipy>=1.11
+scikit-learn>=1.4
+
+# --- Gradient boosting / classical ---
+lightgbm>=4.3
+xgboost>=2.0
+catboost>=1.2
+
+# --- Sequence models / time-series ---
+# Pure-PyTorch Mamba-2 fallback (always installed; works on any platform).
+# The native CUDA kernels (`mamba-ssm==2.2.2`, `causal-conv1d==1.4.0`) are
+# installed separately by scripts/install_env.sh because (a) their PyPI
+# sdists are incomplete, (b) they require nvcc + a matching torch ABI,
+# and (c) mamba-ssm's __init__ pulls in `transformers` for the LM head.
+mambapy>=1.2.0
+einops>=0.8
+# transformers is only needed because mamba_ssm.__init__ unconditionally
+# imports the LM head. Pin to a version that still ships the symbols
+# referenced by mamba-ssm 2.2.2.
+transformers==4.39.3
+tokenizers==0.15.2
+huggingface-hub==0.23.5
+
+# --- Training / experiment tooling ---
+pyyaml>=6.0
+omegaconf>=2.3
+tqdm>=4.66
+rich>=13
+tensorboard>=2.16
+psutil>=5.9        # memoria del proceso (mostrada en el notebook)
+
+# --- Plotting / EDA ---
+matplotlib>=3.8
+seaborn>=0.13
+
+# --- Notebooks ---
+ipykernel>=6.29
+jupyterlab>=4.0
+
+# --- Submission packaging ---
+onnx>=1.16
+onnxruntime>=1.18
+
+# --- Dev / tests ---
+pytest>=8.0
+pytest-cov>=5.0

@@ -1,5 +1,13 @@
 # Data repository
 data/
+competition_package/datasets/
+
+# Pipeline outputs
+experiments/
+
+# Mac
+.DS_Store
+._*
 
 # Python cache files
 __pycache__/

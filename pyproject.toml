@@ -1,22 +1,51 @@
 [project]
 name = "lob-forecasting"
 version = "0.1.0"
-description = "Add your description here"
+description = "Wunder Predictorium - LOB price-movement forecasting"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "ipykernel>=7.2.0",
-    "matplotlib>=3.10.8",
-    "numpy>=2.4.4",
-    "pandas>=3.0.2",
-    "scikit-learn>=1.8.0",
-    "scipy>=1.17.1",
-    "seaborn>=0.13.2",
-    "torch<=2.11.0",
-    "onnxruntime>=1.25.0",
-    "pyarrow>=24.0.0",
-    "tslearn>=0.8.1",
-    "neuralforecast>=3.1.8",
+    # numerical / data
+    "numpy>=1.26",
+    "pandas>=2.2",
+    "pyarrow>=15",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+    # plotting
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    # gradient boosting
+    "lightgbm>=4.3",
+    "xgboost>=2.0",
+    "catboost>=1.2",
+    # deep learning
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "torchaudio==2.5.1",
+    "einops>=0.8",
+    # sequence models
+    "mambapy>=1.2.0",
+    # training tooling
+    "pyyaml>=6.0",
+    "omegaconf>=2.3",
+    "tqdm>=4.66",
+    "rich>=13",
+    "tensorboard>=2.16",
+    # notebooks
+    "ipykernel>=6.29",
+    "jupyterlab>=4.0",
+    # submission packaging
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
+]
+
+[project.optional-dependencies]
+# Native CUDA kernels for Mamba-2. Requires a working CUDA toolchain at
+# install time; skip this group on machines where the build fails — the
+# pipeline falls back to the pure-PyTorch `mambapy` implementation.
+mamba-cuda = [
+    "mamba-ssm>=2.2.2",
+    "causal-conv1d>=1.4.0",
 ]
 
 [[tool.uv.index]]
@@ -32,4 +61,26 @@ torchaudio = { index = "pytorch-cu121" }
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-cov>=5.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[project.scripts]
+lob = "pipeline.cli:main"
+
+# --- Build configuration ---
+# Use a src-layout where every top-level package lives under ./src/. There is
+# no src/__init__.py — src/ is a path entry, not a package.
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+exclude = ["tests*"]

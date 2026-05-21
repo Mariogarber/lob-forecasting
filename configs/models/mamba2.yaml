@@ -1,0 +1,29 @@
+model:
+  name: mamba2
+  params:
+    d_model: 256       # native mamba-ssm CUDA kernel only accepts d_model in {256, 512, 1024, ...}.
+    num_layers: 4
+    headdim: 64
+    dropout: 0.1
+    backend: auto      # auto | mamba_ssm | mambapy
+
+data:
+  train_path: competition_package/datasets/train.parquet
+  valid_path: competition_package/datasets/valid.parquet
+  val_fraction: 0.0
+  seed: 0
+  scaling: standard
+
+training:
+  epochs: 25
+  batch_size: 16
+  learning_rate: 5.0e-4
+  weight_decay: 1.0e-4
+  warmup_epochs: 2
+  grad_clip: 1.0
+  eval_every: 1
+  device: auto
+  amp: true
+  seed: 0
+  loss_name: weighted_pearson
+  early_stopping_patience: 5

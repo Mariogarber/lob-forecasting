@@ -1,0 +1,19 @@
+model:
+  name: linear
+  params:
+    fit_intercept: true
+    n_jobs: -1
+
+data:
+  train_path: competition_package/datasets/train.parquet
+  valid_path: competition_package/datasets/valid.parquet
+  val_fraction: 0.0
+  seed: 0
+  scaling: standard
+
+classical:
+  with_engineered: true
+  rolling_windows: [5, 20]
+  only_scored_rows: true
+  drop_warmup: true
+  log: true

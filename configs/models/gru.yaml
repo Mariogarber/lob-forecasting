@@ -1,0 +1,27 @@
+model:
+  name: gru
+  params:
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.1
+
+data:
+  train_path: competition_package/datasets/train.parquet
+  valid_path: competition_package/datasets/valid.parquet
+  val_fraction: 0.0
+  seed: 0
+  scaling: standard
+
+training:
+  epochs: 20
+  batch_size: 32
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  warmup_epochs: 1
+  grad_clip: 1.0
+  eval_every: 1
+  device: auto
+  amp: true
+  seed: 0
+  loss_name: weighted_pearson
+  early_stopping_patience: 5

@@ -1,0 +1,34 @@
+# Default data / training fragments. Imported by per-model configs through
+# the standalone YAML loader (we keep this as documentation; the loader
+# does not auto-merge — every model config must contain a `data:` block.
+
+data:
+  train_path: competition_package/datasets/train.parquet
+  valid_path: competition_package/datasets/valid.parquet
+  val_fraction: 0.0
+  seed: 0
+  scaling: standard
+
+training_defaults:
+  epochs: 20
+  batch_size: 32
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  warmup_epochs: 1
+  grad_clip: 1.0
+  eval_every: 1
+  num_workers: 0
+  pin_memory: true
+  device: auto
+  amp: true
+  seed: 0
+  loss_name: weighted_pearson
+  loss_kwargs: {}
+  early_stopping_patience: 5
+
+classical_defaults:
+  with_engineered: true
+  rolling_windows: [5, 20]
+  only_scored_rows: true
+  drop_warmup: true
+  log: true
