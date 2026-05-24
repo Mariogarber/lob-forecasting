@@ -104,6 +104,36 @@ def test_gru_end_to_end(split_dfs):
     )
 
 
+def test_tcn_end_to_end(split_dfs):
+    train_df, val_df = split_dfs
+    cls, _ = get_model_class("tcn")
+    model = cls({
+        "n_features": N_FEATURES,
+        "n_targets": N_TARGETS,
+        "channels": 16,
+        "num_layers": 3,
+        "kernel_size": 3,
+        "dropout": 0.0,
+    })
+    train_arr = sequences_from_dataframe(train_df)
+    val_arr = sequences_from_dataframe(val_df)
+    train_ds = SequenceDataset(train_arr)
+    val_ds = SequenceDataset(val_arr)
+    trainer_cfg = TrainerConfig(
+        epochs=1, batch_size=2, learning_rate=1e-3,
+        device="cpu", amp=False, warmup_epochs=0,
+        eval_every=1, early_stopping_patience=0, num_workers=0,
+    )
+    info = train_sequence_model(model, train_ds, val_ds, trainer_cfg)
+    assert info["history"]
+    ev = Evaluator()
+    batched = ev.run_sequence_model(model, val_df, device="cpu")
+    streamed = predict_streaming(model, val_df, device="cpu")
+    np.testing.assert_allclose(
+        streamed.predictions, batched.predictions, atol=1e-4, rtol=1e-3,
+    )
+
+
 def test_submission_packager_with_linear(split_dfs, tmp_path):
     """Verify that package_run produces a valid solution.zip that contains
     every expected artefact."""
