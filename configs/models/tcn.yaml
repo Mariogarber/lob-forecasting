@@ -1,0 +1,30 @@
+model:
+  name: tcn
+  params:
+    # Tuned via scripts/sweep_tcn.py (variant C_L6_ch96, val_pearson=+0.2740).
+    # See experiments/tcn_sweep_results.csv for the full sweep.
+    channels: 96
+    num_layers: 6         # receptive field = 1 + 2*(k-1)*(2^L - 1) = 253 with k=3
+    kernel_size: 3
+    dropout: 0.1
+
+data:
+  train_path: competition_package/datasets/train.parquet
+  valid_path: competition_package/datasets/valid.parquet
+  val_fraction: 0.0
+  seed: 0
+  scaling: standard
+
+training:
+  epochs: 20
+  batch_size: 32
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  warmup_epochs: 1
+  grad_clip: 1.0
+  eval_every: 1
+  device: auto
+  amp: true
+  seed: 0
+  loss_name: weighted_pearson
+  early_stopping_patience: 5

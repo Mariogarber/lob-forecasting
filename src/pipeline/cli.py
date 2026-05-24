@@ -24,12 +24,13 @@ from pathlib import Path
 
 from rich.console import Console
 
-from models import list_models
-
 CONSOLE = Console()
 
 
 def _cmd_list(_args) -> int:
+    # Lazy import: pulling models at module level loads torch before pandas,
+    # which on Windows segfaults pyarrow when the parquet is later read.
+    from models import list_models
     classical = list_models("classical")
     sequence = list_models("sequence")
     CONSOLE.print("[bold]Classical models:[/]")

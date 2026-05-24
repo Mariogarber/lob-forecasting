@@ -39,6 +39,7 @@ _RUNTIME_FILES = [
     ("models/sequence/transformer.py", "models/sequence/transformer.py"),
     ("models/sequence/deeplob.py", "models/sequence/deeplob.py"),
     ("models/sequence/mamba2.py", "models/sequence/mamba2.py"),
+    ("models/sequence/tcn.py", "models/sequence/tcn.py"),
     ("models/classical/__init__.py", "models/classical/__init__.py"),
     ("models/classical/linear.py", "models/classical/linear.py"),
     ("models/classical/ridge.py", "models/classical/ridge.py"),

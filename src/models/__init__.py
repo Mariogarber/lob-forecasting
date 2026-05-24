@@ -56,7 +56,7 @@ from models.classical import (  # noqa: E402,F401
     linear, ridge, random_forest, lightgbm_model,
 )
 from models.sequence import (  # noqa: E402,F401
-    gru, lstm, transformer, deeplob, mamba2,
+    gru, lstm, transformer, deeplob, mamba2, tcn,
 )
 
 

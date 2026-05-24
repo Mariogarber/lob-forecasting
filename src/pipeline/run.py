@@ -17,9 +17,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-import torch
-from rich.console import Console
-
+# IMPORTANT: pandas/pyarrow must be imported BEFORE torch on Windows to
+# avoid an MSVC runtime DLL conflict that segfaults pq.read_table().
+# Keep `from data import (...)` ahead of any torch import.
 from data import (
     FeatureScaler,
     load_train_valid,
@@ -28,6 +28,10 @@ from data import (
     SequenceDataset,
 )
 from data.constants import FEATURE_COLS, N_FEATURES, N_TARGETS
+
+import torch
+from rich.console import Console
+
 from evaluation import Evaluator, write_report, make_run_id
 from models import get_model_class
 from pipeline.config import RunConfig
