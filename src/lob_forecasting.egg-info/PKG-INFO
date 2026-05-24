@@ -50,16 +50,36 @@ See `PROJECT_README.md` for the official rules and `docs/dominio-lob.md` /
 bash scripts/install_env.sh
 conda activate lob
 
+# Install the project in editable mode so `lob ...` / `python -m pipeline.cli ...` work anywhere.
+pip install -e . --no-deps
+
 # All tests should pass on a fresh install.
 pytest
 
-# List registered models.
-python -m pipeline.cli list
-
-# Train a model end-to-end on the official train/valid split.
-# Produces experiments/<model>/<run_id>/{config, train_history, val/, solution.zip}.
+# Two equivalent ways to run the pipeline:
+lob list                                                  # entry point
 python -m pipeline.cli train --config configs/models/lightgbm.yaml
 python -m pipeline.cli train --config configs/models/gru.yaml
+```
+
+### Single-shot deliverable (`main.ipynb`)
+
+The grading-ready notebook lives at the repo root:
+
+```bash
+jupyter lab main.ipynb     # or: jupyter notebook main.ipynb
+```
+
+It covers the full narrative — introduction, EDA, feature engineering, three rounds of
+model iterations (classical / DL / SOTA), model selection and submission packaging — and
+runs on top of the same `src/` pipeline so anything you change in the codebase is
+reflected the next time the notebook is executed. A top-level `QUICK_MODE` flag controls
+whether it trains in ~10–20 min (default, on a subset) or in the full ~hours budget.
+
+The notebook is regenerated from a single Python source:
+
+```bash
+python scripts/make_notebook.py   # writes main.ipynb
 ```
 
 The CLI writes everything to `experiments/<model_name>/<timestamp>/`:

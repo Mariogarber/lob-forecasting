@@ -58,7 +58,7 @@ def build_cells() -> list[nbf.NotebookNode]:
         2. **Feature engineering** sobre microestructura y dinámica del libro.
         3. **Iteración 1 — Baselines clásicos**: Linear / Ridge / Random Forest / LightGBM.
         4. **Iteración 2 — Modelos secuenciales DL básicos**: GRU / LSTM / Transformer causal.
-        5. **Iteración 3 — Modelos específicos / SOTA**: DeepLOB (Zhang 2019) y Mamba-2 (Dao 2024).
+        5. **Iteración 3 — Modelos específicos / SOTA**: DeepLOB (Zhang 2019), TCN (Bai 2018) y Mamba-2 (Dao 2024).
         6. **Comparativa final y selección del mejor modelo**.
 
         El cuaderno se apoya en el pipeline modular del paquete `src/` —cada modelo se entrena con
@@ -142,6 +142,11 @@ def build_cells() -> list[nbf.NotebookNode]:
         # rara vez gana a LightGBM; ponlo a True si te crashea la RAM o tienes prisa.
         SKIP_RF = False
 
+        # Mamba-2 con d_model=256 en GPU consumer (RTX 30-series Laptop) es ~30x más
+        # lento que el resto de DL en full-mode (kernels CUDA nativos saturan el SM).
+        # Activa este flag si solo quieres validar la arquitectura del resto.
+        SKIP_MAMBA = False
+
         # Salta toda la sección de modelos clásicos (linear/ridge/RF/lightgbm) y va
         # directo a los DL. Útil cuando la construcción tabular en CPU no cabe en RAM.
         SKIP_CLASSICAL = False
@@ -158,7 +163,7 @@ def build_cells() -> list[nbf.NotebookNode]:
         SEED = 0
         DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-        print(f"QUICK_MODE={QUICK_MODE}  DEVICE={DEVICE}  SKIP_CLASSICAL={SKIP_CLASSICAL}  SKIP_RF={SKIP_RF}  WITH_ROLLING={WITH_ROLLING}")
+        print(f"QUICK_MODE={QUICK_MODE}  DEVICE={DEVICE}  SKIP_CLASSICAL={SKIP_CLASSICAL}  SKIP_RF={SKIP_RF}  SKIP_MAMBA={SKIP_MAMBA}  WITH_ROLLING={WITH_ROLLING}")
         print(f"RAM inicial: {mem_gb():.2f} GB")
     """))
 
@@ -387,7 +392,7 @@ def build_cells() -> list[nbf.NotebookNode]:
     cells.append(md("""
         ## 4 · Estrategia de modelado
 
-        Probaremos 9 modelos en tres rondas. Las claves son:
+        Probaremos 10 modelos en tres rondas. Las claves son:
 
         * **Splits por `seq_ix`** — usamos el `valid.parquet` oficial; jamás partimos filas dentro de una secuencia.
         * **Loss alineado con la métrica** — `Weighted Pearson Loss` para los modelos DL (con `clamp(-6, 6)` interno) y `sample_weight = |y_true|` para los clásicos.
@@ -404,7 +409,8 @@ def build_cells() -> list[nbf.NotebookNode]:
         | 6 | DL | `lstm` | LSTM 2-layer, streamable. |
         | 7 | DL | `transformer` | Pre-LN encoder + causal mask. |
         | 8 | DL/SOTA | `deeplob` | Zhang 2019 (CNN+LSTM), adaptado a regresión. |
-        | 9 | DL/SOTA | `mamba2` | Selective SSM (kernels nativos CUDA cuando disponibles). |
+        | 9 | DL/SOTA | `tcn` | Temporal Convolutional Network (Bai 2018), dilated causal convs. |
+        | 10 | DL/SOTA | `mamba2` | Selective SSM (kernels nativos CUDA cuando disponibles). |
     """))
 
     cells.append(code("""
@@ -789,9 +795,26 @@ def build_cells() -> list[nbf.NotebookNode]:
     cells.append(md("""
         ## 7 · Iteración 3 — Modelos específicos / SOTA
 
-        **DeepLOB** (Zhang 2019) — CNN multi-escala + bloque inception + LSTM. Pensado para LOB y
-        publicado en IEEE TSP; lo adaptamos a *regression* sustituyendo la cabeza de 3 clases por
-        un `Linear(2)` y propagamos la salida del último step a todo el tiempo.
+        **DeepLOB** (Zhang 2019) — CNN multi-escala + bloque inception + LSTM publicado en IEEE TSP.
+        En el paper original cada ventana de 100 pasos produce **una sola** predicción softmax para
+        el movimiento de mid-price en `T + k`, así que las convs internas no se preocupan por la
+        causalidad: toda la ventana es pasado respecto al target.
+
+        En este reto el target es **per-step** sobre secuencias de 1000 pasos, así que el port ingenuo
+        (mismas convs `(4,1)` sin padding + `F.interpolate` para recuperar `T`) introduce *look-ahead*
+        de ~20 pasos al material de cada predicción. Nuestra adaptación: (i) cabeza softmax → `Linear(2)`
+        por paso, (ii) todas las convs temporales pasan a **causales** (left-pad solo), (iii) se
+        elimina el upsample porque la pila causal preserva `T`. Esto se valida con
+        `tests/models/test_registry.py::test_deeplob_streaming_matches_forward` (paridad batched↔streaming).
+
+        **TCN** (Bai, Kolter & Koltun 2018) — *Temporal Convolutional Network*: pila residual de
+        convs 1-D **causales** con dilatación exponencial (1, 2, 4, 8, 16, …). Con 5 bloques y
+        kernel 3 cubre un *receptive field* de 125 pasos con ~125 k parámetros — mucho más eficiente
+        que la pila kernel-4 de DeepLOB y sin el cuello de botella recurrente de los RNN. La
+        causalidad es por construcción: cada bloque hace `F.pad(..., (k-1)*d, 0)` (left-only),
+        así que el output en `t` depende solo de inputs `<= t`. Se valida con
+        `tests/models/test_registry.py::test_tcn_streaming_matches_forward` y `test_tcn_causality`.
+        Para entender la arquitectura en detalle, ver `docs/tcn.md`.
 
         **Mamba-2** (Dao & Gu 2024) — *Selective State-Space Model* con coste lineal en T. Cuando
         los kernels CUDA nativos (`mamba-ssm`) están disponibles los usamos; en caso contrario el
@@ -814,20 +837,38 @@ def build_cells() -> list[nbf.NotebookNode]:
     """))
 
     cells.append(code("""
-        # Mamba-2 — usa CUDA nativo si está disponible (d_model múltiplo soportado), si no, fallback.
-        mamba_d_model = 256 if torch.cuda.is_available() else 128  # fallback en CPU usa mambapy
-        mamba_model, mamba_info, mamba_eval = run_sequence(
-            "mamba2",
+        # Config tuneada vía scripts/sweep_tcn.py (variante C_L6_ch96, val=+0.2740).
+        # En QUICK_MODE bajamos canales y capas para acotar tiempo.
+        tcn_model, tcn_info, tcn_eval = run_sequence(
+            "tcn",
             {
-                "d_model": mamba_d_model,
-                "num_layers": 3 if QUICK_MODE else 4,
-                "headdim": 64,
+                "channels": 48 if QUICK_MODE else 96,
+                "num_layers": 5 if QUICK_MODE else 6,    # RF: quick=125, full=253
+                "kernel_size": 3,
                 "dropout": 0.1,
-                "backend": "auto",
             },
-            trainer_overrides={"learning_rate": 5e-4},
         )
-        print(f"\\nBackend Mamba-2 elegido: {mamba_model.backend_used}")
+    """))
+
+    cells.append(code("""
+        # Mamba-2 — usa CUDA nativo si está disponible (d_model múltiplo soportado), si no, fallback.
+        if SKIP_MAMBA:
+            mamba_model, mamba_info, mamba_eval = None, None, None
+            print("Saltando Mamba-2 (SKIP_MAMBA=True).")
+        else:
+            mamba_d_model = 256 if torch.cuda.is_available() else 128  # fallback en CPU usa mambapy
+            mamba_model, mamba_info, mamba_eval = run_sequence(
+                "mamba2",
+                {
+                    "d_model": mamba_d_model,
+                    "num_layers": 3 if QUICK_MODE else 4,
+                    "headdim": 64,
+                    "dropout": 0.1,
+                    "backend": "auto",
+                },
+                trainer_overrides={"learning_rate": 5e-4},
+            )
+            print(f"\\nBackend Mamba-2 elegido: {mamba_model.backend_used}")
 
         # Liberamos las arrays / datasets de secuencias — ya están persistidas y los
         # val_eval que necesita la sección 8 quedaron en memoria como objetos Python pequeños.
@@ -880,7 +921,7 @@ def build_cells() -> list[nbf.NotebookNode]:
         all_evals = {}
         candidates = [
             ("gru", gru_eval), ("lstm", lstm_eval), ("transformer", tfm_eval),
-            ("deeplob", deeplob_eval), ("mamba2", mamba_eval),
+            ("deeplob", deeplob_eval), ("tcn", tcn_eval), ("mamba2", mamba_eval),
         ]
         if not SKIP_CLASSICAL:
             candidates += [("linear", linear_eval), ("ridge", ridge_eval), ("lightgbm", lgb_eval)]
@@ -970,6 +1011,11 @@ def build_cells() -> list[nbf.NotebookNode]:
           modo rápido suele quedar por debajo de los RNN.
         * **DeepLOB**: arquitectura específica para LOB; en regresión hay que cuidar que la
           interpolación temporal no diluya la señal del último step.
+        * **TCN**: stack de convoluciones causales con dilatación exponencial. Es el
+          **modelo ganador** del proyecto (+0.2740 val_pearson), supera a LSTM/GRU/Transformer
+          con menos parámetros (~330k) y entrenamiento paralelo. El sweep en
+          `scripts/sweep_tcn.py` confirmó que la ganancia viene de combinar receptive field
+          extra (L=6 → RF=253) con más canales (96), y que kernel=5 no mejora frente a kernel=3.
         * **Mamba-2**: con kernels nativos CUDA escala lineal en T = 1000 sin penalización
           de memoria, lo que lo hace especialmente atractivo para esta longitud.
 
@@ -1019,7 +1065,7 @@ def build_notebook() -> nbf.NotebookNode:
 
 def main() -> None:
     nb = build_notebook()
-    OUT_PATH.write_text(nbf.writes(nb, version=4))
+    OUT_PATH.write_text(nbf.writes(nb, version=4), encoding="utf-8")
     n_md = sum(1 for c in nb.cells if c.cell_type == "markdown")
     n_code = sum(1 for c in nb.cells if c.cell_type == "code")
     print(f"wrote {OUT_PATH}  ({n_md} markdown + {n_code} code cells)")

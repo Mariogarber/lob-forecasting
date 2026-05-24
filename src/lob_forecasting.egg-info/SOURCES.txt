@@ -1,12 +1,5 @@
 README.md
 pyproject.toml
-src/data/__init__.py
-src/data/constants.py
-src/data/io.py
-src/data/scaling.py
-src/data/sequence.py
-src/data/splits.py
-src/data/tabular.py
 src/evaluation/__init__.py
 src/evaluation/evaluator.py
 src/evaluation/plots.py
