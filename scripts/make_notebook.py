@@ -128,8 +128,8 @@ def build_cells() -> list[nbf.NotebookNode]:
     """))
 
     cells.append(code("""
-        # ⚙️  Toggle global. Cambia a False para entrenar al 100% (varias horas).
-        QUICK_MODE = True
+        # ⚙️  Toggle global. Cambia a True para iteración rápida.
+        QUICK_MODE = False
 
         # Subconjunto de secuencias usadas en modo rápido. Pon None para usar todas.
         QUICK_N_TRAIN_SEQS = 800
@@ -147,6 +147,11 @@ def build_cells() -> list[nbf.NotebookNode]:
         # Activa este flag si solo quieres validar la arquitectura del resto.
         SKIP_MAMBA = False
 
+        # TLOB (Garcia et al. 2024) — SOTA específico de LOB. Es el modelo nuevo
+        # que añadimos a esta iteración. Activa para saltarlo si solo quieres
+        # validar el resto.
+        SKIP_TLOB = False
+
         # Salta toda la sección de modelos clásicos (linear/ridge/RF/lightgbm) y va
         # directo a los DL. Útil cuando la construcción tabular en CPU no cabe en RAM.
         SKIP_CLASSICAL = False
@@ -163,7 +168,7 @@ def build_cells() -> list[nbf.NotebookNode]:
         SEED = 0
         DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-        print(f"QUICK_MODE={QUICK_MODE}  DEVICE={DEVICE}  SKIP_CLASSICAL={SKIP_CLASSICAL}  SKIP_RF={SKIP_RF}  SKIP_MAMBA={SKIP_MAMBA}  WITH_ROLLING={WITH_ROLLING}")
+        print(f"QUICK_MODE={QUICK_MODE}  DEVICE={DEVICE}  SKIP_CLASSICAL={SKIP_CLASSICAL}  SKIP_RF={SKIP_RF}  SKIP_MAMBA={SKIP_MAMBA}  SKIP_TLOB={SKIP_TLOB}  WITH_ROLLING={WITH_ROLLING}")
         print(f"RAM inicial: {mem_gb():.2f} GB")
     """))
 
@@ -411,6 +416,7 @@ def build_cells() -> list[nbf.NotebookNode]:
         | 8 | DL/SOTA | `deeplob` | Zhang 2019 (CNN+LSTM), adaptado a regresión. |
         | 9 | DL/SOTA | `tcn` | Temporal Convolutional Network (Bai 2018), dilated causal convs. |
         | 10 | DL/SOTA | `mamba2` | Selective SSM (kernels nativos CUDA cuando disponibles). |
+        | 11 | DL/SOTA | `tlob` | **Dual-axis Transformer** (Garcia 2024). Attention sobre features + attention causal sobre tiempo. Independente del orden de columnas. |
     """))
 
     cells.append(code("""
@@ -851,24 +857,76 @@ def build_cells() -> list[nbf.NotebookNode]:
     """))
 
     cells.append(code("""
-        # Mamba-2 — usa CUDA nativo si está disponible (d_model múltiplo soportado), si no, fallback.
+        # Mamba-2 — receta anti-overfit rev 2:
+        # · d_model=128 + 3 capas + dropout=0.3 + drop_path=0.1
+        # · per-target heads (arregla el colapso de t1 que vimos en runs previos)
+        # · LR 2e-4, WD 5e-4, EMA 0.999, hasta 80 épocas con paciencia 12
+        # Para d_model=128 el kernel CUDA nativo no aplica, así que cae a mambapy
+        # (Mamba-1 puro PyTorch, ~3× más lento pero estable y sin overfit prematuro).
         if SKIP_MAMBA:
             mamba_model, mamba_info, mamba_eval = None, None, None
             print("Saltando Mamba-2 (SKIP_MAMBA=True).")
         else:
-            mamba_d_model = 256 if torch.cuda.is_available() else 128  # fallback en CPU usa mambapy
             mamba_model, mamba_info, mamba_eval = run_sequence(
                 "mamba2",
                 {
-                    "d_model": mamba_d_model,
-                    "num_layers": 3 if QUICK_MODE else 4,
+                    "d_model": 128,
+                    "num_layers": 3,
                     "headdim": 64,
-                    "dropout": 0.1,
+                    "dropout": 0.3,
+                    "drop_path": 0.1,
                     "backend": "auto",
                 },
-                trainer_overrides={"learning_rate": 5e-4},
+                trainer_overrides={
+                    "learning_rate": 2e-4,
+                    "weight_decay": 5e-4,
+                    "warmup_epochs": 1 if QUICK_MODE else 3,
+                    "epochs": QUICK_EPOCHS if QUICK_MODE else 80,
+                    "early_stopping_patience": 4 if QUICK_MODE else 12,
+                    "ema_decay": 0.999,
+                    "batch_size": 32,
+                },
             )
             print(f"\\nBackend Mamba-2 elegido: {mamba_model.backend_used}")
+    """))
+
+    cells.append(code("""
+        # TLOB (Garcia et al., 2024, arXiv:2403.09989) — el SOTA específico de LOB.
+        # Doble attention: features (cada timestep atiende a las 32 columnas)
+        # + tiempo (cada feature atiende causalmente al pasado). Per-target heads.
+        # Independente del orden de columnas (a diferencia de DeepLOB).
+        #
+        # CONFIG LONG-TRAINING (para entrenar muchas horas sin sobre-ajustar):
+        #   · 4 capas duales = 8 sub-bloques de attention (depth del paper)
+        #   · dropout 0.25 + drop_path 0.15 (regularización agresiva)
+        #   · EMA 0.9995 (Polyak averaging con ventana efectiva ~2000 pasos)
+        #   · 150 épocas con cosine + warmup 8, paciencia 25
+        #   · batch_size 8 → 5.85 GB peak en RTX 4060 con margen para eval
+        if SKIP_TLOB:
+            tlob_model, tlob_info, tlob_eval = None, None, None
+            print("Saltando TLOB (SKIP_TLOB=True).")
+        else:
+            tlob_model, tlob_info, tlob_eval = run_sequence(
+                "tlob",
+                {
+                    "d_model": 64,
+                    "num_layers": 2 if QUICK_MODE else 4,
+                    "n_heads": 4,
+                    "ffn_mult": 4,
+                    "dropout": 0.20 if QUICK_MODE else 0.25,
+                    "drop_path": 0.10 if QUICK_MODE else 0.15,
+                    "max_len": 1024,
+                },
+                trainer_overrides={
+                    "learning_rate": 3e-4,
+                    "weight_decay": 5e-4 if QUICK_MODE else 8e-4,
+                    "warmup_epochs": 1 if QUICK_MODE else 8,
+                    "epochs": QUICK_EPOCHS if QUICK_MODE else 150,
+                    "early_stopping_patience": 4 if QUICK_MODE else 25,
+                    "ema_decay": 0.999 if QUICK_MODE else 0.9995,
+                    "batch_size": 8,
+                },
+            )
 
         # Liberamos las arrays / datasets de secuencias — ya están persistidas y los
         # val_eval que necesita la sección 8 quedaron en memoria como objetos Python pequeños.
@@ -922,6 +980,7 @@ def build_cells() -> list[nbf.NotebookNode]:
         candidates = [
             ("gru", gru_eval), ("lstm", lstm_eval), ("transformer", tfm_eval),
             ("deeplob", deeplob_eval), ("tcn", tcn_eval), ("mamba2", mamba_eval),
+            ("tlob", tlob_eval),
         ]
         if not SKIP_CLASSICAL:
             candidates += [("linear", linear_eval), ("ridge", ridge_eval), ("lightgbm", lgb_eval)]

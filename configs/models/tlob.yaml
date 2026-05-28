@@ -1,0 +1,38 @@
+model:
+  name: tlob
+  params:
+    # Long-training config: balanced for many-hour training on a 4060.
+    # 4 dual-blocks = 8 alternating attention sub-blocks (feature + time).
+    # Matches the depth used by the TLOB paper (Garcia 2024, Table 2).
+    # Peak GPU memory at fwd+bwd+AMP: 5.85 GB (1.6 GB headroom on 8 GB).
+    d_model: 64
+    num_layers: 4        # 8 sub-blocks total (4 feature + 4 time)
+    n_heads: 4
+    ffn_mult: 4
+    dropout: 0.25        # up from 0.2 — more aggressive regulariser for long training
+    drop_path: 0.15      # linear schedule 0 -> 0.15 across the 8 sub-blocks
+    max_len: 1024
+
+data:
+  train_path: competition_package/datasets/train.parquet
+  valid_path: competition_package/datasets/valid.parquet
+  val_fraction: 0.0
+  seed: 0
+  scaling: standard
+
+training:
+  # Long-training recipe. 150 epochs lets the cosine schedule unfold fully;
+  # patience 25 means ~17% of total epochs as the no-improvement window.
+  epochs: 150
+  batch_size: 8          # 5.85 GB peak; bigger batches OOM
+  learning_rate: 3.0e-4
+  weight_decay: 8.0e-4   # up from 5e-4 — more L2 with longer training
+  warmup_epochs: 8       # up from 3 — longer warmup pairs with cosine decay over 150 ep
+  grad_clip: 1.0
+  eval_every: 1
+  device: auto
+  amp: true
+  seed: 0
+  loss_name: weighted_pearson
+  ema_decay: 0.9995      # up from 0.999 — slower EMA = larger effective window (~2000 steps)
+  early_stopping_patience: 25

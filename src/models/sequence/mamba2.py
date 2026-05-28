@@ -5,13 +5,16 @@ falls back to the pure-PyTorch implementation from ``mambapy``. The
 fallback is roughly 3-4x slower but does not require building Triton or
 NVCC, which matters under WSL2 / consumer GPUs.
 
-We expose Mamba-2 specifically (not Mamba-1) because:
-  * Mamba-2 maps cleanly to matmul kernels (SSD form),
-  * the published TSF literature (S-Mamba, Bi-Mamba+) uses Mamba-2,
-  * Mamba-1 is still available as ``backbone: 'mamba1'`` if needed.
+Anti-overfit design (rev 2):
 
-The block stack is interleaved with RMSNorm and a residual projection
-layer to keep the gradients well-behaved at depth 4-8.
+* Per-target heads — t0 and t1 stop fighting over the same final Linear.
+  In the previous design we observed t1 collapse to ~0.04 while t0 held
+  at 0.37. Decoupling the heads kills that pathology.
+* Dropout between Mamba blocks (not only at input + head). The residual
+  stream was memorising training sequences otherwise.
+* Stochastic depth (DropPath) on the native path with a linear schedule
+  from 0 in layer 0 to ``drop_path`` in the last layer. Standard recipe
+  for deep SSM / Transformer stacks.
 """
 
 from __future__ import annotations
@@ -59,9 +62,21 @@ def _try_import_mambapy_mamba1():
         return None
 
 
+def _drop_path(x: torch.Tensor, drop_prob: float, training: bool) -> torch.Tensor:
+    """Per-sample stochastic depth. Drops the entire residual branch for a
+    fraction ``drop_prob`` of the batch, then rescales by ``1/(1-drop_prob)``
+    so the expected output magnitude is unchanged at inference."""
+    if drop_prob <= 0.0 or not training:
+        return x
+    keep_prob = 1.0 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    mask = torch.empty(shape, dtype=x.dtype, device=x.device).bernoulli_(keep_prob)
+    return x.div(keep_prob) * mask
+
+
 @register_model("mamba2", kind="sequence")
 class Mamba2Model(SequenceModel):
-    """Mamba-2 selective SSM backbone.
+    """Mamba-2 selective SSM backbone with anti-overfit regularisers.
 
     When the native CUDA kernels are available (``mamba-ssm`` installed
     and nvcc usable), we get true Mamba-2 with linear attention via SSD.
@@ -76,13 +91,25 @@ class Mamba2Model(SequenceModel):
         n_features = int(config["n_features"])
         n_targets = int(config["n_targets"])
         d_model = int(config.get("d_model", 128))
-        n_layers = int(config.get("num_layers", 4))
+        n_layers = int(config.get("num_layers", 3))
         headdim = int(config.get("headdim", 64))
-        dropout = float(config.get("dropout", 0.1))
+        dropout = float(config.get("dropout", 0.3))
+        drop_path = float(config.get("drop_path", 0.1))
         backend_request = config.get("backend", "auto")  # auto | mamba_ssm | mambapy
 
+        self.n_targets = n_targets
+        self.drop_path_max = drop_path
+
         self.proj = FeatureProjector(n_features, d_model, dropout=dropout)
-        self.head = RegressionHead(d_model, n_targets, dropout=dropout)
+
+        # Per-target heads. Each one emits 1 scalar; we concat at the end.
+        # This is the single biggest change against the previous design,
+        # because t0 and t1 had very different scales and a shared Linear
+        # was letting the loss converge to t0-only.
+        self.heads = nn.ModuleList(
+            [RegressionHead(d_model, 1, dropout=dropout) for _ in range(n_targets)]
+        )
+
         self.backend_used: str = ""
         self._uses_internal_stack: bool = False
 
@@ -96,6 +123,12 @@ class Mamba2Model(SequenceModel):
             self.norms = nn.ModuleList(
                 [nn.LayerNorm(d_model) for _ in range(n_layers)]
             )
+            self.block_dropout = nn.Dropout(dropout)
+            # Linear schedule: layer 0 keeps everything, last layer drops at
+            # ``drop_path`` rate. Standard ViT / Mamba recipe.
+            self.drop_path_rates = [
+                drop_path * i / max(1, n_layers - 1) for i in range(n_layers)
+            ]
             self.backend_used = "mamba_ssm"
         else:
             loaded = _try_import_mambapy_mamba1()
@@ -108,8 +141,12 @@ class Mamba2Model(SequenceModel):
                 expand_factor=int(config.get("expand_factor", 2)),
                 use_cuda=False,
             )
-            # mambapy's Mamba already stacks n_layers internally + norms.
+            # mambapy's Mamba already stacks n_layers internally + norms,
+            # so we cannot inject per-block dropout / drop_path the same
+            # way. Apply input-level dropout (already in FeatureProjector)
+            # and final-head dropout, then a single trunk-output dropout.
             self.stack = Mamba1(mamba_cfg)
+            self.trunk_dropout = nn.Dropout(dropout)
             self._uses_internal_stack = True
             self.backend_used = "mambapy_mamba1"
             warnings.warn(
@@ -148,8 +185,13 @@ class Mamba2Model(SequenceModel):
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         x = self.proj(features)                  # (B, T, D)
         if self._uses_internal_stack:
-            x = self.stack(x)                    # mambapy stacks + norms internally
+            x = self.stack(x)
+            x = self.trunk_dropout(x)
         else:
-            for block, norm in zip(self.layers, self.norms):
-                x = x + block(norm(x))           # pre-LN residual
-        return self.head(x)
+            for i, (block, norm) in enumerate(zip(self.layers, self.norms)):
+                residual = block(norm(x))
+                residual = self.block_dropout(residual)
+                residual = _drop_path(residual, self.drop_path_rates[i], self.training)
+                x = x + residual
+        # Per-target heads, then concat along the feature axis -> (B, T, K).
+        return torch.cat([h(x) for h in self.heads], dim=-1)

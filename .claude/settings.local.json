@@ -40,7 +40,8 @@
       "Bash(grep -vE \"^[\\\\s]*[\\\\\\\\\\\\|/-]+\\\\s*$\")",
       "Bash(/home/eder/miniconda3/envs/lob/bin/pip uninstall *)",
       "Bash(/home/eder/miniconda3/envs/lob/bin/pip install *)",
-      "Bash(/home/eder/miniconda3/envs/lob/bin/lob list *)"
+      "Bash(/home/eder/miniconda3/envs/lob/bin/lob list *)",
+      "Bash(grep *)"
     ]
   }
 }

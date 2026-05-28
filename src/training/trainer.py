@@ -44,6 +44,54 @@ CONSOLE = Console()
 
 
 # ---------------------------------------------------------------------------
+# EMA helper
+# ---------------------------------------------------------------------------
+
+
+class _EMA:
+    """Exponential moving average of model parameters.
+
+    Maintains a CPU shadow copy of every trainable tensor in the model and
+    updates it after each optimizer step. ``apply()`` / ``restore()`` swap
+    the shadow weights into the model for evaluation and put the live
+    weights back for the next training step.
+    """
+
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = float(decay)
+        self.shadow: dict[str, torch.Tensor] = {}
+        self._backup: dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        d = self.decay
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            s = self.shadow[name]
+            # In-place: s = d * s + (1 - d) * p
+            s.mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def apply(self, model: nn.Module) -> None:
+        self._backup = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self._backup[name] = p.detach().clone()
+                p.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        for name, p in model.named_parameters():
+            if name in self._backup:
+                p.copy_(self._backup[name])
+        self._backup = {}
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -65,6 +113,11 @@ class TrainerConfig:
     loss_name: str = "weighted_pearson"
     loss_kwargs: dict[str, Any] = field(default_factory=dict)
     early_stopping_patience: int = 5
+    # Exponential moving average of weights (Polyak averaging). 0.0 disables
+    # the shadow copy; common values are 0.999 / 0.9995. When enabled the
+    # EMA weights are what gets evaluated AND what is saved as best_state,
+    # so the persisted ``model.pt`` is the EMA — not the raw step weights.
+    ema_decay: float = 0.0
 
     def resolve_device(self) -> torch.device:
         if self.device == "auto":
@@ -138,6 +191,10 @@ class Trainer:
         self.amp = config.amp and self.device.type == "cuda"
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp)
 
+        # EMA shadow: created lazily on first step so it lives on the same
+        # device as the model after .to(device) above.
+        self.ema = _EMA(self.model, decay=config.ema_decay) if config.ema_decay > 0 else None
+
         self.best_score: float = -float("inf")
         self.best_state: dict | None = None
         self.history: list[dict] = []
@@ -152,7 +209,16 @@ class Trainer:
             train_loss = self._train_one_epoch(epoch)
             val_info: dict[str, Any] = {}
             if self.val_loader is not None and (epoch % self.config.eval_every == 0):
-                val_info = self.evaluate(self.val_loader)
+                # Evaluate using the EMA copy when enabled: smoother than
+                # the raw step weights, especially in the late-training
+                # regime where SGD bounces around a minimum.
+                if self.ema is not None:
+                    self.ema.apply(self.model)
+                try:
+                    val_info = self.evaluate(self.val_loader)
+                finally:
+                    if self.ema is not None:
+                        self.ema.restore(self.model)
             elapsed = time.time() - t0
 
             self.history.append(
@@ -170,9 +236,18 @@ class Trainer:
             improved = score > self.best_score
             if improved:
                 self.best_score = score
-                self.best_state = {
-                    k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
-                }
+                # When EMA is active, snapshot the EMA weights — those are
+                # the ones we want to ship, not the noisier step weights.
+                if self.ema is not None:
+                    self.ema.apply(self.model)
+                    self.best_state = {
+                        k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
+                    }
+                    self.ema.restore(self.model)
+                else:
+                    self.best_state = {
+                        k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()
+                    }
                 self._epochs_since_improvement = 0
             else:
                 self._epochs_since_improvement += 1
@@ -240,6 +315,8 @@ class Trainer:
                 self.optimizer.step()
 
             self.scheduler.step()
+            if self.ema is not None:
+                self.ema.update(self.model)
             bs = features.size(0)
             n_samples += bs
             loss_sum += float(loss.item()) * bs

@@ -9,7 +9,7 @@ from models import MODEL_REGISTRY, get_model_class, list_models
 
 EXPECTED_MODELS = {
     "linear", "ridge", "random_forest", "lightgbm",
-    "gru", "lstm", "transformer", "deeplob", "mamba2", "tcn",
+    "gru", "lstm", "transformer", "deeplob", "mamba2", "tcn", "tlob",
 }
 
 
@@ -32,7 +32,7 @@ def test_list_models_filter():
     assert classical.isdisjoint(sequence)
 
 
-@pytest.mark.parametrize("name", ["gru", "lstm", "transformer", "deeplob", "tcn"])
+@pytest.mark.parametrize("name", ["gru", "lstm", "transformer", "deeplob", "tcn", "tlob"])
 def test_sequence_forward_shape(name):
     cls, _ = get_model_class(name)
     model = cls({"n_features": N_FEATURES, "n_targets": N_TARGETS}).eval()
@@ -152,6 +152,62 @@ def test_tcn_causality():
                 atol=1e-5, rtol=1e-4,
                 msg=f"TCN leaks future info into step <= {t_cut}",
             )
+
+
+def test_tlob_causality():
+    # TLOB's time-attention uses is_causal=True. Perturbing future inputs
+    # at step t+1..T must NOT change the prediction at step t. This is
+    # the load-bearing invariant — any leak here invalidates the model.
+    cls, _ = get_model_class("tlob")
+    model = cls({
+        "n_features": N_FEATURES,
+        "n_targets": N_TARGETS,
+        "d_model": 32,
+        "num_layers": 2,
+        "n_heads": 4,
+        "dropout": 0.0,
+        "drop_path": 0.0,
+    }).eval()
+    B, T = 1, 24
+    x = torch.randn(B, T, N_FEATURES)
+    with torch.no_grad():
+        y_clean = model(x)
+        for t_cut in [5, 10, 15]:
+            x_perturbed = x.clone()
+            x_perturbed[:, t_cut + 1 :, :] = torch.randn_like(x_perturbed[:, t_cut + 1 :, :])
+            y_perturbed = model(x_perturbed)
+            torch.testing.assert_close(
+                y_clean[:, : t_cut + 1, :],
+                y_perturbed[:, : t_cut + 1, :],
+                atol=1e-5, rtol=1e-4,
+                msg=f"TLOB leaks future info into step <= {t_cut}",
+            )
+
+
+def test_tlob_per_target_heads_decouple():
+    # Per-target heads must produce independent predictions: perturbing
+    # head[0] weights must NOT change head[1]'s output. Catches accidental
+    # parameter sharing across heads.
+    cls, _ = get_model_class("tlob")
+    model = cls({
+        "n_features": N_FEATURES,
+        "n_targets": N_TARGETS,
+        "d_model": 32,
+        "num_layers": 2,
+        "n_heads": 4,
+        "dropout": 0.0,
+        "drop_path": 0.0,
+    }).eval()
+    x = torch.randn(1, 16, N_FEATURES)
+    with torch.no_grad():
+        y_clean = model(x)
+        # Perturb only head[0].
+        for p in model.heads[0].parameters():
+            p.data.add_(torch.randn_like(p) * 0.1)
+        y_perturbed = model(x)
+    # head[0] (column 0) should change; head[1] (column 1) should NOT.
+    assert not torch.allclose(y_clean[..., 0], y_perturbed[..., 0])
+    torch.testing.assert_close(y_clean[..., 1], y_perturbed[..., 1])
 
 
 def test_deeplob_streaming_matches_forward():
