@@ -21,14 +21,16 @@ conda activate lob
 
 The env path is `/home/eder/miniconda3/envs/lob`. For non-interactive runs use the absolute
 interpreter `/home/eder/miniconda3/envs/lob/bin/python`. PyTorch is pinned to the CUDA 12.1
-wheel index. **Native `mamba-ssm` 2.2.2 + `causal-conv1d` 1.4.0 are installed** and the
-`Mamba2` model uses them when `d_model in {256, 512, 1024, ...}` (kernel constraint).
-Other `d_model` values fall back to `mambapy`'s pure-PyTorch Mamba-1 stack.
+wheel index. The **`Mamba2` model is a self-contained pure-PyTorch Mamba-2 (SSD)** — it does
+**not** require `mamba-ssm` / `causal-conv1d` (those are not installed and are awkward to
+build under WSL2). The selective scan runs in fp32 even under AMP, so it is numerically
+stable on consumer GPUs without any native kernels. `d_model` is unconstrained (the old
+`{256, 512, 1024, ...}` kernel-strides limit no longer applies); only
+`expand*d_model % headdim == 0` must hold.
 
-Pinned versions: torch==2.5.1+cu121 / mamba-ssm==2.2.2 / causal-conv1d==1.4.0 /
-transformers==4.39.3 + tokenizers==0.15.2 + huggingface-hub==0.23.5 (the transformers
-trio is only there because `mamba_ssm.__init__` imports the LM head). Do not let pip
-upgrade these — `mamba-ssm 2.3.x` requires `torch >= 2.6`, which breaks the cu121 pin.
+Pinned versions: torch==2.5.1+cu121. (`mamba-ssm` / `causal-conv1d` / the `transformers`
+trio are no longer needed by any model — the previous Mamba path that imported them has been
+removed.)
 
 ```bash
 pytest                                                   # full test suite (81 tests)

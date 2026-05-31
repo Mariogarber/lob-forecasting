@@ -32,6 +32,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from models.base import SequenceModel
 from models import register_model
@@ -154,6 +155,10 @@ class TLOBModel(SequenceModel):
         dropout = float(config.get("dropout", 0.2))
         drop_path = float(config.get("drop_path", 0.1))
         max_len = int(config.get("max_len", 1024))
+        # Gradient checkpointing: recompute each attention block in the backward
+        # pass instead of stashing its activations. Trades ~30% extra compute for
+        # a large cut in peak VRAM — the right knob when TLOB OOMs on an 8 GB card.
+        self.grad_checkpoint = bool(config.get("grad_checkpoint", False))
 
         self.n_features = n_features
         self.n_targets = n_targets
@@ -220,16 +225,21 @@ class TLOBModel(SequenceModel):
         pos = self.time_pos[:T].view(1, T, 1, d).to(x.dtype)
         x = x + pos
 
+        def run(block, t):
+            if self.grad_checkpoint and self.training and t.requires_grad:
+                return checkpoint(block, t, use_reentrant=False)
+            return block(t)
+
         for i, block in enumerate(self.blocks):
             if i % 2 == 0:
                 # Feature attention: (B, T, F, d) -> (B*T, F, d).
                 x = x.reshape(B * T, F_, d)
-                x = block(x)
+                x = run(block, x)
                 x = x.reshape(B, T, F_, d)
             else:
                 # Time attention (causal): (B, T, F, d) -> (B*F, T, d).
                 x = x.permute(0, 2, 1, 3).reshape(B * F_, T, d)
-                x = block(x)
+                x = run(block, x)
                 x = x.reshape(B, F_, T, d).permute(0, 2, 1, 3).contiguous()
 
         # Pool across feature axis -> (B, T, d).

@@ -39,8 +39,46 @@ def test_split_by_seq_ix_disjoint(tiny_lob_df):
 def test_sequence_dataset_collate(tiny_lob_df):
     arrays = sequences_from_dataframe(tiny_lob_df)
     ds = SequenceDataset(arrays)
+    assert not ds.augmented
     batch = pad_collate([ds[i] for i in range(min(3, len(ds)))])
     assert batch["features"].shape == (3, SEQ_LEN, len(FEATURE_COLS))
     assert batch["targets"].shape == (3, SEQ_LEN, 2)
     assert batch["mask"].dtype == torch.bool
     assert batch["seq_id"].shape == (3,)
+
+
+def test_crop_augmentation_shape_and_warmup(tiny_lob_df):
+    # Cropping returns fixed-length windows; the first `warmup` steps of each
+    # crop are always unscored (cold-start context for the SSM/RNN state).
+    arrays = sequences_from_dataframe(tiny_lob_df)
+    crop = 300
+    ds = SequenceDataset(arrays, crop_len=crop, warmup=WARMUP_STEPS, seed=0)
+    assert ds.augmented
+    item = ds[0]
+    assert item["features"].shape == (crop, len(FEATURE_COLS))
+    assert item["targets"].shape == (crop, 2)
+    assert item["mask"].shape == (crop,)
+    assert not item["mask"][:WARMUP_STEPS].any()      # warmup remasked off
+    # Collate still stacks because every crop is the same length.
+    batch = pad_collate([ds[i] for i in range(min(3, len(ds)))])
+    assert batch["features"].shape == (3, crop, len(FEATURE_COLS))
+
+
+def test_crop_is_random_across_draws(tiny_lob_df):
+    # Different draws should pick different windows (stochastic across epochs).
+    arrays = sequences_from_dataframe(tiny_lob_df)
+    ds = SequenceDataset(arrays, crop_len=200, seed=0)
+    draws = {ds[0]["features"][0, 0].item() for _ in range(20)}
+    assert len(draws) > 1, "crop start is not varying across draws"
+
+
+def test_jitter_perturbs_features_only(tiny_lob_df):
+    arrays = sequences_from_dataframe(tiny_lob_df)
+    ds = SequenceDataset(arrays, jitter_std=0.1, seed=0)
+    assert ds.augmented
+    clean = torch.from_numpy(arrays.features[0])
+    noisy = ds[0]["features"]
+    assert noisy.shape == clean.shape
+    assert not torch.allclose(noisy, clean)            # features perturbed
+    # targets/mask untouched by jitter
+    torch.testing.assert_close(ds[0]["targets"], torch.from_numpy(arrays.targets[0]))

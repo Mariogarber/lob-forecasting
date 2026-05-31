@@ -73,13 +73,22 @@ def _run_sequence(cfg: RunConfig, model_name: str) -> dict[str, Any]:
     CONSOLE.print(f"[bold green]>>> SEQUENCE RUN[/]: {model_name}")
     train_df, valid_df, scaler = _materialise_data(cfg)
 
-    # Build datasets.
+    # Build datasets. Augmentation (random crop + feature jitter) is applied to
+    # the TRAIN set only — the val set must mirror the scorer (full sequences,
+    # no noise) so its weighted-Pearson stays comparable across runs.
+    aug = dict(cfg.data.get("augment", {}) or {})
     train_arr = sequences_from_dataframe(train_df)
     valid_arr = sequences_from_dataframe(valid_df)
-    train_ds = SequenceDataset(train_arr)
+    train_ds = SequenceDataset(
+        train_arr,
+        crop_len=aug.get("crop_len"),
+        jitter_std=float(aug.get("jitter_std", 0.0)),
+        seed=int(cfg.data.get("seed", 0)),
+    )
     val_ds = SequenceDataset(valid_arr)
     CONSOLE.print(
         f"  train: {len(train_ds)} sequences | val: {len(val_ds)} sequences"
+        + (f" | augment: {aug}" if train_ds.augmented else " | augment: off")
     )
 
     # Build model.

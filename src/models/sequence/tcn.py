@@ -76,11 +76,30 @@ class CausalConv1d(nn.Module):
         return self.conv(x)
 
 
+class ChannelLayerNorm(nn.Module):
+    """LayerNorm over the channel axis of a ``(B, C, T)`` tensor.
+
+    Normalising *per timestep across channels* keeps the op strictly causal
+    (no information flows across the time axis), so streaming and the causality
+    invariant are preserved — unlike BatchNorm, which would mix batch/time stats.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+
+
 class TemporalBlock(nn.Module):
     """One residual block of the TCN.
 
-    Two causal dilated convs, ReLU + dropout between them, plus a 1x1
-    projection on the residual path when channel counts differ.
+    Two causal dilated convs, activation + dropout between them, plus a 1x1
+    projection on the residual path when channel counts differ. Optionally a
+    channel LayerNorm after each conv (``norm="layer"``) and a configurable
+    activation (``relu`` | ``gelu``) — both off/relu by default to reproduce the
+    original locuslab/TCN behaviour.
     """
 
     def __init__(
@@ -90,6 +109,8 @@ class TemporalBlock(nn.Module):
         kernel_size: int,
         dilation: int,
         dropout: float = 0.1,
+        activation: str = "relu",
+        norm: str = "none",
     ):
         super().__init__()
         # weight_norm() expects a Module with a ``weight`` parameter, so we
@@ -108,6 +129,15 @@ class TemporalBlock(nn.Module):
             if in_channels != out_channels
             else nn.Identity()
         )
+        self.act = nn.GELU() if activation == "gelu" else nn.ReLU()
+        if norm == "layer":
+            self.norm1: nn.Module = ChannelLayerNorm(out_channels)
+            self.norm2: nn.Module = ChannelLayerNorm(out_channels)
+        elif norm == "none":
+            self.norm1 = nn.Identity()
+            self.norm2 = nn.Identity()
+        else:
+            raise ValueError(f"norm must be 'none' or 'layer', got {norm!r}")
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -119,12 +149,10 @@ class TemporalBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = F.pad(x, (self.pad, 0))
-        h = self.conv1(h)
-        h = self.dropout1(F.relu(h))
+        h = self.dropout1(self.act(self.norm1(self.conv1(h))))
         h = F.pad(h, (self.pad, 0))
-        h = self.conv2(h)
-        h = self.dropout2(F.relu(h))
-        return F.relu(h + self.residual(x))
+        h = self.dropout2(self.act(self.norm2(self.conv2(h))))
+        return self.act(h + self.residual(x))
 
 
 @register_model("tcn", kind="sequence")
@@ -144,6 +172,9 @@ class TCN(SequenceModel):
         num_layers = int(config.get("num_layers", 5))
         kernel_size = int(config.get("kernel_size", 3))
         dropout = float(config.get("dropout", 0.1))
+        activation = str(config.get("activation", "relu"))
+        norm = str(config.get("norm", "none"))
+        per_target_heads = bool(config.get("per_target_heads", False))
 
         layers: list[nn.Module] = []
         in_ch = n_features
@@ -156,11 +187,24 @@ class TCN(SequenceModel):
                     kernel_size=kernel_size,
                     dilation=dilation,
                     dropout=dropout,
+                    activation=activation,
+                    norm=norm,
                 )
             )
             in_ch = channels
         self.tcn = nn.Sequential(*layers)
-        self.head = RegressionHead(channels, n_targets, dropout=dropout)
+
+        # Single shared head (default) or one independent head per target.
+        # NOTE: per-target *heads* only decouple the final Linear; the trunk is
+        # still shared (full-trunk decoupling did not help Mamba-2's t1). Cheap
+        # to try, so it is exposed as a flag.
+        self.per_target_heads = per_target_heads
+        if per_target_heads:
+            self.heads = nn.ModuleList(
+                [RegressionHead(channels, 1, dropout=dropout) for _ in range(n_targets)]
+            )
+        else:
+            self.head = RegressionHead(channels, n_targets, dropout=dropout)
 
         # Receptive field for reference / matches the window_size default.
         self.receptive_field = 1 + 2 * (kernel_size - 1) * (2 ** num_layers - 1)
@@ -173,4 +217,6 @@ class TCN(SequenceModel):
         x = features.transpose(1, 2)
         x = self.tcn(x)
         x = x.transpose(1, 2)
+        if self.per_target_heads:
+            return torch.cat([h(x) for h in self.heads], dim=-1)
         return self.head(x)

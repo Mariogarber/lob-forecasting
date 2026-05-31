@@ -96,6 +96,30 @@ class _EMA:
 # ---------------------------------------------------------------------------
 
 
+def _param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
+    """Split parameters into decay / no-decay groups for AdamW.
+
+    Only multi-dim weight matrices (Linear/Conv kernels) get weight decay.
+    Everything 1-D — biases, LayerNorm/RMSNorm gains, and the SSM scalars
+    ``A_log`` / ``dt_bias`` / ``D`` — is excluded. Decaying those shrinks the
+    state-space dynamics and normalisation scales toward zero, which *hurts*
+    rather than regularises. This is what lets us raise ``weight_decay`` to
+    transformer-scale values (1e-2+) safely as a generalisation lever.
+    """
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim <= 1 or name.endswith(("A_log", "dt_bias", "D")):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
 @dataclass
 class TrainerConfig:
     epochs: int = 20
@@ -170,9 +194,8 @@ class Trainer:
         )
 
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            _param_groups(self.model, config.weight_decay),
             lr=config.learning_rate,
-            weight_decay=config.weight_decay,
         )
 
         total_steps = max(1, len(self.train_loader) * max(1, config.epochs))

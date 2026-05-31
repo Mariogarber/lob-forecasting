@@ -415,7 +415,7 @@ def build_cells() -> list[nbf.NotebookNode]:
         | 7 | DL | `transformer` | Pre-LN encoder + causal mask. |
         | 8 | DL/SOTA | `deeplob` | Zhang 2019 (CNN+LSTM), adaptado a regresión. |
         | 9 | DL/SOTA | `tcn` | Temporal Convolutional Network (Bai 2018), dilated causal convs. |
-        | 10 | DL/SOTA | `mamba2` | Selective SSM (kernels nativos CUDA cuando disponibles). |
+        | 10 | DL/SOTA | `mamba2` | Selective SSM (Mamba-2 SSD, PyTorch puro, scan fp32, lineal en T). |
         | 11 | DL/SOTA | `tlob` | **Dual-axis Transformer** (Garcia 2024). Attention sobre features + attention causal sobre tiempo. Independente del orden de columnas. |
     """))
 
@@ -686,15 +686,24 @@ def build_cells() -> list[nbf.NotebookNode]:
         del train_use, val_use
         gc.collect()
 
+        # Augmentation SOLO en train: crops temporales aleatorios + jitter de features.
+        # Con ~10.7k secuencias fijas, un modelo de alta capacidad memoriza en pocas
+        # epochs (Mamba-2 daba su mejor val en la epoch ~5). Los crops convierten esas
+        # 10.7k ventanas fijas en sub-trayectorias prácticamente ilimitadas -> es la
+        # palanca anti-overfit nº1. El val_ds queda intacto (secuencias completas,
+        # sin ruido) para que su weighted-Pearson sea comparable al scorer.
+        AUGMENT = {} if QUICK_MODE else {"crop_len": 512, "jitter_std": 0.05}
+
         train_arr = sequences_from_dataframe(train_scaled)
         val_arr   = sequences_from_dataframe(val_scaled)
-        train_ds  = SequenceDataset(train_arr)
+        train_ds  = SequenceDataset(train_arr, seed=SEED, **AUGMENT)
         val_ds    = SequenceDataset(val_arr)
         # Las arrays están ya copiadas dentro del Dataset; podemos soltar las versiones intermedias.
         del train_arr
         gc.collect()
 
-        print(f"train_ds: {len(train_ds)} secuencias  ·  val_ds: {len(val_ds)} secuencias")
+        print(f"train_ds: {len(train_ds)} secuencias  ·  val_ds: {len(val_ds)} secuencias"
+              f"  ·  augment: {AUGMENT or 'off'}")
         print(f"RAM tras montar sequence datasets: {mem_gb():.2f} GB")
     """))
 
@@ -822,10 +831,12 @@ def build_cells() -> list[nbf.NotebookNode]:
         `tests/models/test_registry.py::test_tcn_streaming_matches_forward` y `test_tcn_causality`.
         Para entender la arquitectura en detalle, ver `docs/tcn.md`.
 
-        **Mamba-2** (Dao & Gu 2024) — *Selective State-Space Model* con coste lineal en T. Cuando
-        los kernels CUDA nativos (`mamba-ssm`) están disponibles los usamos; en caso contrario el
-        modelo cae a `mambapy` (Mamba-1 puro PyTorch). El kernel nativo solo acepta
-        `d_model ∈ {256, 512, 1024, …}`.
+        **Mamba-2** (Dao & Gu 2024) — *Selective State-Space Model* con coste **lineal** en T (sin
+        matriz de atención O(T²)). Implementación **propia en PyTorch puro** (algoritmo SSD por
+        *chunks*); no depende de `mamba-ssm`/`causal-conv1d` (que no compilan fácil en WSL2). El
+        *scan* selectivo corre en **fp32 aun bajo AMP fp16**, así que los `exp()`/`cumsum` del
+        decaimiento nunca desbordan a NaN → no hay colapso de la métrica. Incluye streaming
+        recurrente O(1) por paso para el scorer. Ver `src/models/sequence/mamba2.py`.
     """))
 
     cells.append(code("""
@@ -857,12 +868,18 @@ def build_cells() -> list[nbf.NotebookNode]:
     """))
 
     cells.append(code("""
-        # Mamba-2 — receta anti-overfit rev 2:
-        # · d_model=128 + 3 capas + dropout=0.3 + drop_path=0.1
-        # · per-target heads (arregla el colapso de t1 que vimos en runs previos)
-        # · LR 2e-4, WD 5e-4, EMA 0.999, hasta 80 épocas con paciencia 12
-        # Para d_model=128 el kernel CUDA nativo no aplica, así que cae a mambapy
-        # (Mamba-1 puro PyTorch, ~3× más lento pero estable y sin overfit prematuro).
+        # Mamba-2 (SSD, PyTorch puro) — preset CAPACIDAD ALTA + AUGMENTATION:
+        # Experimentos medidos: subir regularización BAJÓ el pico (0.262->0.248) y las
+        # ramas por target (dual-trunk) NO ayudaron (t1 colapsa igual con rama propia,
+        # luego no era interferencia t0/t1 sino que t1 es un target de baja señal que
+        # sobre-ajusta a ~0 por sí solo). Receta ganadora: capacidad alta + augmentation
+        # (crops 512, retrasan el colapso) + early-stopping (guarda el pico; el colapso
+        # nunca llega al checkpoint shippeado).
+        # · d_model=256 · 8 capas · d_state=128 · headdim=64  (~3.7M params)
+        # · dropout 0.2 + drop_path 0.1 (reg ligera); weight_decay 0.01 (param groups)
+        # · LR 2e-4, warmup 4, 100 epochs, paciencia 15; augment crops 512 + jitter
+        # · ~4.6 GB pico @ batch=24, T=512 en la 3060 Ti  ->  ~1.5 min/epoch
+        # (Dual-trunk sigue disponible vía split_targets=True pero no aporta; off.)
         if SKIP_MAMBA:
             mamba_model, mamba_info, mamba_eval = None, None, None
             print("Saltando Mamba-2 (SKIP_MAMBA=True).")
@@ -870,38 +887,42 @@ def build_cells() -> list[nbf.NotebookNode]:
             mamba_model, mamba_info, mamba_eval = run_sequence(
                 "mamba2",
                 {
-                    "d_model": 128,
-                    "num_layers": 3,
+                    "d_model": 128 if QUICK_MODE else 256,
+                    "num_layers": 4 if QUICK_MODE else 8,
                     "headdim": 64,
-                    "dropout": 0.3,
+                    "d_state": 64 if QUICK_MODE else 128,
+                    "expand": 2,
+                    "chunk_size": 128,        # 512 es múltiplo de 128 -> sin padding
+                    "dropout": 0.2,
                     "drop_path": 0.1,
-                    "backend": "auto",
                 },
                 trainer_overrides={
                     "learning_rate": 2e-4,
-                    "weight_decay": 5e-4,
-                    "warmup_epochs": 1 if QUICK_MODE else 3,
-                    "epochs": QUICK_EPOCHS if QUICK_MODE else 80,
-                    "early_stopping_patience": 4 if QUICK_MODE else 12,
+                    "weight_decay": 1e-2,
+                    "warmup_epochs": 1 if QUICK_MODE else 4,
+                    "epochs": QUICK_EPOCHS if QUICK_MODE else 100,
+                    "early_stopping_patience": 4 if QUICK_MODE else 15,
                     "ema_decay": 0.999,
-                    "batch_size": 32,
+                    "batch_size": 24,         # ~4.6 GB pico; sube a 32 (6.2 GB) si quieres
                 },
             )
-            print(f"\\nBackend Mamba-2 elegido: {mamba_model.backend_used}")
+            print(f"\\nMamba-2 topology: {mamba_model.backend_used} "
+                  f"({sum(p.numel() for p in mamba_model.parameters())/1e6:.2f} M params)")
     """))
 
     cells.append(code("""
         # TLOB (Garcia et al., 2024, arXiv:2403.09989) — el SOTA específico de LOB.
         # Doble attention: features (cada timestep atiende a las 32 columnas)
         # + tiempo (cada feature atiende causalmente al pasado). Per-target heads.
-        # Independente del orden de columnas (a diferencia de DeepLOB).
         #
-        # CONFIG LONG-TRAINING (para entrenar muchas horas sin sobre-ajustar):
-        #   · 4 capas duales = 8 sub-bloques de attention (depth del paper)
-        #   · dropout 0.25 + drop_path 0.15 (regularización agresiva)
-        #   · EMA 0.9995 (Polyak averaging con ventana efectiva ~2000 pasos)
-        #   · 150 épocas con cosine + warmup 8, paciencia 25
-        #   · batch_size 8 → 5.85 GB peak en RTX 4060 con margen para eval
+        # CONFIG BAJO-VRAM + MÁS REGULARIZADA (la anterior d64/L4 hacía OOM en la
+        # 3060 Ti: 5.86 GB de pico + fragmentación tras un run largo). Fixes:
+        #   · grad_checkpoint=True -> recomputa los bloques en backward: 5.86 -> 1.50 GB
+        #     (mismo modelo, exacto, ~30% más lento). ES la palanca clave.
+        #   · modelo más pequeño (d48/L3) + dropout 0.35 + drop_path 0.30
+        #   · los crops de 512 (AUGMENT global) ~bajan a la mitad la activación dominante
+        #   -> pico ~0.5-0.6 GB. Si aun así OOM en runs largos, lanza con
+        #      PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
         if SKIP_TLOB:
             tlob_model, tlob_info, tlob_eval = None, None, None
             print("Saltando TLOB (SKIP_TLOB=True).")
@@ -909,21 +930,22 @@ def build_cells() -> list[nbf.NotebookNode]:
             tlob_model, tlob_info, tlob_eval = run_sequence(
                 "tlob",
                 {
-                    "d_model": 64,
-                    "num_layers": 2 if QUICK_MODE else 4,
+                    "d_model": 48,
+                    "num_layers": 2 if QUICK_MODE else 3,
                     "n_heads": 4,
                     "ffn_mult": 4,
-                    "dropout": 0.20 if QUICK_MODE else 0.25,
-                    "drop_path": 0.10 if QUICK_MODE else 0.15,
+                    "dropout": 0.25 if QUICK_MODE else 0.35,
+                    "drop_path": 0.10 if QUICK_MODE else 0.30,
                     "max_len": 1024,
+                    "grad_checkpoint": not QUICK_MODE,
                 },
                 trainer_overrides={
                     "learning_rate": 3e-4,
-                    "weight_decay": 5e-4 if QUICK_MODE else 8e-4,
-                    "warmup_epochs": 1 if QUICK_MODE else 8,
-                    "epochs": QUICK_EPOCHS if QUICK_MODE else 150,
-                    "early_stopping_patience": 4 if QUICK_MODE else 25,
-                    "ema_decay": 0.999 if QUICK_MODE else 0.9995,
+                    "weight_decay": 5e-4 if QUICK_MODE else 8e-3,
+                    "warmup_epochs": 1 if QUICK_MODE else 6,
+                    "epochs": QUICK_EPOCHS if QUICK_MODE else 100,
+                    "early_stopping_patience": 4 if QUICK_MODE else 15,
+                    "ema_decay": 0.999,
                     "batch_size": 8,
                 },
             )
@@ -1022,6 +1044,124 @@ def build_cells() -> list[nbf.NotebookNode]:
         ax.set_title(f"Distribución de correlación por secuencia — {best_name}")
         fig.tight_layout()
         plt.show()
+    """))
+
+    # -------- 8.bis · Ensemble --------
+    cells.append(md("""
+        ## 8.bis · Ensemble (promedio ponderado)
+
+        Cada target tiene un **techo de señal por modelo** (~0.38 en `t0`, ~0.13 en `t1`):
+        TCN y Mamba-2, arquitecturas muy distintas, llegan al *mismo* techo por separado —
+        es un límite de la predictibilidad de los datos, no del modelo. La ganancia fiable
+        restante viene de **promediar modelos decorrelacionados**: sus errores no están
+        perfectamente correlacionados, así que la media reduce varianza y suele superar al
+        mejor individual (sobre todo en `t1`).
+
+        Incluimos **LightGBM** además de los modelos de secuencia: es el miembro con el sesgo
+        inductivo más distinto (árboles vs redes), por lo que sus errores decorrelacionan más
+        y aporta la mayor ganancia al promedio. Mezclar secuencia + clásico exige alinear las
+        predicciones por `(seq_ix, step_in_seq)` (los dos evaluadores recorren las filas en
+        orden distinto), lo cual hacemos explícitamente.
+
+        Afinamos pesos convexos sobre las predicciones de **validación** (ya enmascaradas en
+        `all_evals`) maximizando el weighted-Pearson del scorer, y si el ensemble supera al
+        mejor individual lo empaquetamos como `solution.zip` final
+        (`submission.package_ensemble`). El `EnsemblePredictionModel` avanza el estado de
+        streaming de *cada* miembro en cada paso (el de LightGBM recomputa sus features
+        ingenieradas incrementalmente) y promedia solo en las filas puntuadas.
+    """))
+
+    cells.append(code("""
+        from submission.ensemble import tune_ensemble_weights
+        from submission import package_ensemble
+
+        # Candidatos: (nombre, modelo, kind). Los de secuencia comparten el scaler;
+        # LightGBM es clásico (sesgo inductivo distinto -> más decorrelación -> más ganancia).
+        _candidates = [
+            ("tcn",      tcn_model       if 'tcn_model'     in dir() else None, "sequence"),
+            ("mamba2",   mamba_model     if 'mamba_model'   in dir() else None, "sequence"),
+            ("gru",      gru_model       if 'gru_model'     in dir() else None, "sequence"),
+            ("lstm",     lstm_model      if 'lstm_model'    in dir() else None, "sequence"),
+            ("deeplob",  deeplob_model   if 'deeplob_model' in dir() else None, "sequence"),
+            ("tlob",     tlob_model      if 'tlob_model'    in dir() else None, "sequence"),
+            ("lightgbm", lgb_model       if 'lgb_model'     in dir() else None, "classical"),
+        ]
+        _members = [(n, m, k) for n, m, k in _candidates if m is not None and n in all_evals]
+
+        def _aligned(ev):
+            # Ordena las filas puntuadas por (seq_ix, step_in_seq): mezclar miembros de
+            # secuencia y clásicos exige alinear (cada evaluador las emite en distinto orden).
+            key = ev.seq_ids.astype(np.int64) * 1000 + ev.step_ids.astype(np.int64)
+            order = np.argsort(key, kind="stable")
+            return key[order], ev.predictions[order], ev.targets[order]
+
+        ensemble_zip = None
+        tune = None
+        if len(_members) >= 2:
+            names = [n for n, _, _ in _members]
+            keys0, _, y_ens = _aligned(all_evals[names[0]])
+            preds = []
+            for n in names:
+                k, p, y = _aligned(all_evals[n])
+                assert np.array_equal(k, keys0), f"{n}: filas puntuadas no coinciden con {names[0]}"
+                assert np.allclose(y, y_ens, atol=1e-4), f"{n}: targets desalineados"
+                preds.append(p)
+
+            tune = tune_ensemble_weights(preds, y_ens, step=0.05)
+            best_single = max(tune["per_member"])
+            for n, s in sorted(zip(names, tune["per_member"]), key=lambda t: -t[1]):
+                print(f"  {n:<10} val_wp = {s:+.4f}")
+            print(f"\\nPesos óptimos: {{{', '.join(f'{n}:{w:.2f}' for n, w in zip(names, tune['weights']))}}}")
+            print(f"ENSEMBLE val_wp = {tune['score']:+.4f}  "
+                  f"(mejor individual = {best_single:+.4f}, ganancia = {tune['score'] - best_single:+.4f})")
+
+            _blend = sum(w * p for w, p in zip(tune["weights"], preds))
+            _ens_per = summary(y_ens, _blend)["per_target"]
+
+            if tune["score"] > best_single:
+                # Conservamos solo miembros con peso relevante (>=2%), renormalizando.
+                kept = [(n, m, k, w) for (n, m, k), w in zip(_members, tune["weights"]) if w >= 0.02]
+                wsum = sum(w for *_, w in kept)
+                ens_dir = EXPERIMENTS_ROOT / "ensemble" / make_run_id("ensemble")
+                ens_dir.mkdir(parents=True, exist_ok=True)
+                members = []
+                for n, m, k, w in kept:
+                    if k == "sequence":
+                        art = ens_dir / f"{n}.pt"; m.save(art)
+                        members.append(dict(kind="sequence", model_name=n, model_artifact=art,
+                                            scaler_state=scaler.state_dict()))
+                    else:  # classical (LightGBM): recomputa features ingenieradas al vuelo
+                        art = ens_dir / f"{n}.joblib"; m.save(art)
+                        members.append(dict(kind="classical", model_name=n, model_artifact=art,
+                                            feature_columns=list(m.feature_names_),
+                                            with_engineered=True,
+                                            rolling_windows=tuple(ROLLING_WINDOWS)))
+                utils_py = Path("competition_package/utils.py")
+                if utils_py.exists():
+                    ensemble_zip = package_ensemble(
+                        run_dir=ens_dir, src_root=Path("src"), utils_py=utils_py,
+                        members=members, weights=[w / wsum for *_, w in kept])
+                    print(f"\\n>>> El ENSEMBLE es el modelo final. solution.zip: {ensemble_zip}")
+                    print(f"    miembros: {[(n, round(w / wsum, 2)) for n, _, _, w in kept]}")
+            else:
+                print("\\nEl ensemble no supera al mejor individual; se entrega el modelo único.")
+
+            # Registrar el ensemble en la tabla acumulada de resultados (+ CSV).
+            if 'results' in dir():
+                results.append({
+                    "model": "ensemble", "kind": "ensemble",
+                    "val_weighted_pearson": float(tune["score"]),
+                    "val_t0": float(_ens_per["t0"]), "val_t1": float(_ens_per["t1"]),
+                    "members": ", ".join(f"{n}:{w:.2f}" for n, w in zip(names, tune["weights"]) if w >= 0.02),
+                })
+                if '_flush_results' in dir():
+                    _flush_results()
+                results_df = pd.DataFrame(results).sort_values(
+                    "val_weighted_pearson", ascending=False).reset_index(drop=True)
+                print("\\nTabla de resultados actualizada (ensemble incluido):")
+                print(results_df[["model", "kind", "val_weighted_pearson", "val_t0", "val_t1"]].to_string(index=False))
+        else:
+            print("Menos de 2 miembros disponibles; se omite el ensemble.")
     """))
 
     # -------- 9 · Selección del mejor modelo --------

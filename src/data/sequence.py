@@ -94,26 +94,81 @@ def sequences_from_dataframe(
 
 
 class SequenceDataset(Dataset):
-    """PyTorch Dataset where one item = one full sequence.
+    """PyTorch Dataset where one item = one (optionally cropped) sequence.
 
     Tensors are kept in CPU pinned-memory friendly numpy arrays and lazily
     converted to torch in `__getitem__` so workers can fork the data.
+
+    Training-time augmentation (off by default — pass the knobs explicitly so
+    the **validation** dataset stays untouched and comparable to the scorer):
+
+    * ``crop_len`` — if set and smaller than the sequence length, every
+      ``__getitem__`` returns a random contiguous window of this length. This
+      is the highest-leverage regulariser here: ~10.7k fixed 1000-step windows
+      become effectively unlimited sub-trajectories, so a high-capacity model
+      can no longer memorise the training set in a few epochs. The first
+      ``warmup`` steps of *each crop* are re-masked to ``False`` (unscored) so
+      the model always gets cold-start context for its SSM/RNN state before any
+      position is scored — matching how the scorer warms up from step 0. We
+      additionally intersect with the original ``need_prediction`` mask, so a
+      crop can never score a position the competition would not.
+
+    * ``jitter_std`` — Gaussian noise added to the (already standardised)
+      features each draw. A cheap, strong regulariser for noisy LOB inputs.
+
+    Augmentation is stochastic across epochs (fresh draws each ``__getitem__``).
+    Pass ``seed`` for reproducible draws (used by tests).
     """
 
-    def __init__(self, arrays: SequenceArrays):
+    def __init__(
+        self,
+        arrays: SequenceArrays,
+        *,
+        crop_len: int | None = None,
+        jitter_std: float = 0.0,
+        warmup: int = WARMUP_STEPS,
+        seed: int | None = None,
+    ):
         self.features = arrays.features
         self.targets = arrays.targets
         self.mask = arrays.mask
         self.seq_ids = arrays.seq_ids
+        self.crop_len = int(crop_len) if crop_len else None
+        self.jitter_std = float(jitter_std)
+        self.warmup = int(warmup)
+        self._rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
         return self.features.shape[0]
 
+    @property
+    def augmented(self) -> bool:
+        T = self.features.shape[1]
+        return (self.crop_len is not None and self.crop_len < T) or self.jitter_std > 0
+
     def __getitem__(self, idx: int) -> dict:
+        features = self.features[idx]
+        targets = self.targets[idx]
+        mask = self.mask[idx]
+
+        T = features.shape[0]
+        if self.crop_len is not None and self.crop_len < T:
+            start = int(self._rng.integers(0, T - self.crop_len + 1))
+            stop = start + self.crop_len
+            features = features[start:stop]
+            targets = targets[start:stop]
+            mask = mask[start:stop].copy()       # copy: about to mutate
+            # Cold-start: never score before the SSM/RNN state has warmed up.
+            mask[: self.warmup] = False
+
+        if self.jitter_std > 0:
+            noise = self._rng.normal(0.0, self.jitter_std, size=features.shape)
+            features = features + noise.astype(np.float32)
+
         return {
-            "features": torch.from_numpy(self.features[idx]),
-            "targets": torch.from_numpy(self.targets[idx]),
-            "mask": torch.from_numpy(self.mask[idx]),
+            "features": torch.from_numpy(np.ascontiguousarray(features)),
+            "targets": torch.from_numpy(np.ascontiguousarray(targets)),
+            "mask": torch.from_numpy(np.ascontiguousarray(mask)),
             "seq_id": int(self.seq_ids[idx]),
         }
 

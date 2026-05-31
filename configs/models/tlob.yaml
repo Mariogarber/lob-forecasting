@@ -1,17 +1,21 @@
 model:
   name: tlob
   params:
-    # Long-training config: balanced for many-hour training on a 4060.
-    # 4 dual-blocks = 8 alternating attention sub-blocks (feature + time).
-    # Matches the depth used by the TLOB paper (Garcia 2024, Table 2).
-    # Peak GPU memory at fwd+bwd+AMP: 5.85 GB (1.6 GB headroom on 8 GB).
-    d_model: 64
-    num_layers: 4        # 8 sub-blocks total (4 feature + 4 time)
-    n_heads: 4
+    # LOW-VRAM + MORE-REGULARIZED preset. The previous config (d64/L4, no
+    # checkpointing) peaked at 5.86 GB and OOM'd on the 8 GB RTX 3060 Ti after a
+    # long run (fragmentation pushed it over the edge). Two structural fixes:
+    #   * grad_checkpoint: recompute attention blocks in backward instead of
+    #     storing activations -> 5.86 GB -> 1.50 GB at the SAME model (4x).
+    #   * smaller model (d48/L3) + crop_len 512 augmentation -> ~0.48 GB peak.
+    # Net: reduced complexity + much more regularisation + huge VRAM headroom.
+    d_model: 48          # 64 -> 48
+    num_layers: 3        # 4 -> 3  (6 alternating attention sub-blocks)
+    n_heads: 4           # head_dim = 48/4 = 12
     ffn_mult: 4
-    dropout: 0.25        # up from 0.2 — more aggressive regulariser for long training
-    drop_path: 0.15      # linear schedule 0 -> 0.15 across the 8 sub-blocks
+    dropout: 0.35        # 0.25 -> 0.35
+    drop_path: 0.30      # 0.15 -> 0.30 (aggressive stochastic depth)
     max_len: 1024
+    grad_checkpoint: true   # the key VRAM lever (exact, just ~30% slower)
 
 data:
   train_path: competition_package/datasets/train.parquet
@@ -19,20 +23,25 @@ data:
   val_fraction: 0.0
   seed: 0
   scaling: standard
+  # Random 512-step crops: TLOB's feature-attention reshapes to (B*T, F, d), so
+  # halving T (1000 -> 512) ~halves its dominant activation AND regularises.
+  augment:
+    crop_len: 512
+    jitter_std: 0.05
 
 training:
-  # Long-training recipe. 150 epochs lets the cosine schedule unfold fully;
-  # patience 25 means ~17% of total epochs as the no-improvement window.
-  epochs: 150
-  batch_size: 8          # 5.85 GB peak; bigger batches OOM
+  # Long runs fragment VRAM; if you still see a late OOM, launch with
+  #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  epochs: 100          # 150 -> 100 (crops make epochs cheaper; less wall-clock)
+  batch_size: 8        # ~0.6 GB peak now; plenty of headroom to raise if wanted
   learning_rate: 3.0e-4
-  weight_decay: 8.0e-4   # up from 5e-4 — more L2 with longer training
-  warmup_epochs: 8       # up from 3 — longer warmup pairs with cosine decay over 150 ep
+  weight_decay: 8.0e-3   # decoupled via param groups (norms/biases excluded)
+  warmup_epochs: 6
   grad_clip: 1.0
   eval_every: 1
   device: auto
   amp: true
   seed: 0
   loss_name: weighted_pearson
-  ema_decay: 0.9995      # up from 0.999 — slower EMA = larger effective window (~2000 steps)
-  early_stopping_patience: 25
+  ema_decay: 0.999
+  early_stopping_patience: 15

@@ -1,15 +1,32 @@
 model:
   name: mamba2
   params:
-    # Anti-overfit rev 2. Falls back to mambapy (pure-PyTorch Mamba-1)
-    # because d_model=128 is outside the native CUDA kernel's strides
-    # constraint. ~3x slower per epoch but eliminates the 4M-param blow-up.
-    d_model: 128
-    num_layers: 3
+    # Real Mamba-2 (SSD), pure-PyTorch — no mamba-ssm / causal-conv1d needed.
+    #
+    # Recipe history (measured on val):
+    #   * powerful single-trunk (L8/d_state128, light reg, NO aug) -> peak 0.262 @ ep5
+    #   * over-regularized (L6/d_state64, dropout0.3, aug)         -> peak 0.248 @ ep10
+    #   * dual-trunk (per-target branches)                         -> peak ~0.23, NO gain
+    # Conclusion: the score is capped by **t1**, which is a low-signal target that
+    # overfits to ~0 on its own (a separate t1 branch collapses identically — so it
+    # was never t0/t1 interference). Heavier regularisation only lowered the peak.
+    # So: keep HIGH capacity, lean on augmentation to delay the collapse, and let
+    # early-stopping ship the peak checkpoint (the collapse never reaches it).
+    d_model: 256
+    num_layers: 8            # high capacity gave the best peak
     headdim: 64
-    dropout: 0.3              # 0.1 -> 0.3 (also gates *between* blocks now)
-    drop_path: 0.1            # stochastic depth, linear schedule across layers
-    backend: auto             # auto picks mambapy at d_model=128
+    d_state: 128
+    expand: 2
+    d_conv: 4
+    ngroups: 1
+    chunk_size: 128          # crop_len 512 is a multiple -> no scan padding
+    dropout: 0.2             # light — heavier reg measurably lowered the peak
+    drop_path: 0.1
+    # ~3.7 M params. SSD scan stays fp32 under AMP -> no NaN/metric collapse.
+    #
+    # Per-target branches are available but OFF by default (no measured gain,
+    # +33% params / +30% time). To try: split_targets: true, n_shared_layers: 6,
+    # n_branch_layers: 2.
 
 data:
   train_path: competition_package/datasets/train.parquet
@@ -17,18 +34,24 @@ data:
   val_fraction: 0.0
   seed: 0
   scaling: standard
+  # Augmentation (TRAIN ONLY; val stays full-length, clean). Random 512-step
+  # crops turn ~10.7k fixed windows into ~unlimited sub-trajectories and measurably
+  # DELAY the t1 collapse, so the joint val peak holds higher for longer.
+  augment:
+    crop_len: 512
+    jitter_std: 0.05
 
 training:
-  epochs: 80                  # 25 -> 80 (we have headroom)
-  batch_size: 32              # 16 -> 32 (less gradient noise)
-  learning_rate: 2.0e-4       # 5e-4 -> 2e-4 (model was overshooting in 2 epochs)
-  weight_decay: 5.0e-4        # 1e-4 -> 5e-4
-  warmup_epochs: 3            # 2 -> 3
+  epochs: 100
+  batch_size: 24              # 4.64 GB peak @ T=512; bs=32 -> 6.16 GB if you want
+  learning_rate: 2.0e-4       # the LR that produced the best peak
+  weight_decay: 1.0e-2        # decoupled (param groups exclude norms/biases/SSM)
+  warmup_epochs: 4
   grad_clip: 1.0
   eval_every: 1
   device: auto
   amp: true
   seed: 0
   loss_name: weighted_pearson
-  ema_decay: 0.999            # NEW: Polyak averaging of weights
-  early_stopping_patience: 12 # 5 -> 12 (lower LR needs more time)
+  ema_decay: 0.999
+  early_stopping_patience: 15  # the peak comes early; this just guards the tail
